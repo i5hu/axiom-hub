@@ -1,6 +1,7 @@
 -- ============================================================
---  MOG OR DIE — AXIOM HUB v2.1
---  FIXED: Rayfield:Notify (capital keys), Gen1 API confirmed
+--  MOG OR DIE — AXIOM HUB v2.2
+--  FIX: Auto Collect now teleports CFrame directly to items
+--  Server detects proximity on its own heartbeat — no remote needed
 -- ============================================================
 
 local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
@@ -18,9 +19,7 @@ local LocalPlayer = Players.LocalPlayer
 local MogOrDie            = ReplicatedStorage:WaitForChild("MogOrDie", 15)
 local Config              = require(MogOrDie:WaitForChild("Config"))
 local CollectibleStream   = MogOrDie:WaitForChild("CollectibleStream", 10)
-local ClientCollectibles  = Workspace:WaitForChild("ClientCollectibles", 10)
 local WorldTravelRequest  = MogOrDie:WaitForChild("WorldTravelRequest", 10)
-local WorldTravelEvent    = MogOrDie:WaitForChild("WorldTravelEvent", 10)
 local ClaimPlaytimeReward = MogOrDie:WaitForChild("ClaimPlaytimeReward", 10)
 local PlaytimeRewardEvent = MogOrDie:WaitForChild("PlaytimeRewardEvent", 10)
 local MogBattleEvent      = MogOrDie:WaitForChild("MogBattleEvent", 10)
@@ -54,7 +53,7 @@ local State = {
     autoCollect      = false,
     totalCollected   = 0,
     collectRadius    = Config.Spawning and Config.Spawning.CollectRadius or 8,
-    farmDelay        = 0.35,
+    farmDelay        = 0.15,
     priorityDiamond  = true,
     interceptedItems = {},
     autoBoss         = false,
@@ -69,11 +68,10 @@ local State = {
     targetDistrict   = "StarterDistrict",
     battleCooldown   = false,
     cooldownEndsAt   = 0,
-    collectRemote    = nil,
 }
 
 -- ============================================================
--- NOTIFY HELPER (confirmed: Rayfield:Notify, capital keys)
+-- NOTIFY
 -- ============================================================
 local function notify(title, content, duration)
     pcall(function()
@@ -114,37 +112,23 @@ local function nameMatch(name, frags)
 end
 
 -- ============================================================
--- COLLECT REMOTE
--- ============================================================
-local function findCollectRemote()
-    local patterns = { "collect", "pickup", "grab", "claim", "acquire" }
-    for _, obj in ipairs(MogOrDie:GetDescendants()) do
-        if obj:IsA("RemoteEvent") or obj:IsA("RemoteFunction") then
-            if nameMatch(obj.Name, patterns) then
-                State.collectRemote = obj
-                print("[Axiom] Collect remote:", obj.Name)
-                return
-            end
-        end
-    end
-end
-findCollectRemote()
-
--- ============================================================
 -- STREAM INTERCEPTOR
 -- ============================================================
 local function installInterceptor()
     for _, conn in getconnections(CollectibleStream.OnClientEvent) do
         local old; old = hookfunction(conn.Function, function(...)
-            local raw = { ... }
+            local raw    = { ... }
             local action = raw[1]
             if action == "add" or action == "collected" then
                 local p = raw[2]
                 if type(p) == "table" then
                     State.interceptedItems[p[1]] = {
-                        id = p[1], typeName = SortedTypes[p[2]],
+                        id       = p[1],
+                        typeName = SortedTypes[p[2]],
                         position = Vector3.new(p[3], p[4], p[5]),
-                        golden = p[6]==1, diamond = p[7]==1, t = os.clock(),
+                        golden   = p[6] == 1,
+                        diamond  = p[7] == 1,
+                        t        = os.clock(),
                     }
                 end
             elseif action == "remove" then
@@ -157,9 +141,12 @@ local function installInterceptor()
                             for _, p in ipairs(items) do
                                 if type(p) == "table" then
                                     State.interceptedItems[p[1]] = {
-                                        id = p[1], typeName = SortedTypes[p[2]],
-                                        position = Vector3.new(p[3]or 0,p[4]or 0,p[5]or 0),
-                                        golden = p[6]==1, diamond = p[7]==1, t = os.clock(),
+                                        id       = p[1],
+                                        typeName = SortedTypes[p[2]],
+                                        position = Vector3.new(p[3] or 0, p[4] or 0, p[5] or 0),
+                                        golden   = p[6] == 1,
+                                        diamond  = p[7] == 1,
+                                        t        = os.clock(),
                                     }
                                 end
                             end
@@ -170,38 +157,14 @@ local function installInterceptor()
             return old(...)
         end)
     end
-    print("[Axiom] Interceptor installed")
+    print("[Axiom] Stream interceptor installed")
 end
 installInterceptor()
 
 -- ============================================================
--- CLIENT COLLECTIBLES WATCHER
--- ============================================================
-if ClientCollectibles then
-    ClientCollectibles.ChildAdded:Connect(function(child)
-        if not State.autoCollect then return end
-        local root = getRoot()
-        if not root then return end
-        local prompt = child:FindFirstChildOfClass("ProximityPrompt")
-            or child:FindFirstChild("ProximityPrompt", true)
-        if prompt then pcall(fireproximityprompt, prompt) end
-        local part = child:IsA("BasePart") and child or child:FindFirstChildOfClass("BasePart")
-        if part then
-            pcall(firetouchinterest, root, part, 0)
-            pcall(firetouchinterest, root, part, 1)
-        end
-        local cd = child:FindFirstChildOfClass("ClickDetector")
-            or child:FindFirstChild("ClickDetector", true)
-        if cd then pcall(fireclickdetector, cd) end
-        if State.collectRemote then
-            local id = child:GetAttribute("CollectibleId") or child:GetAttribute("Id") or child.Name
-            pcall(function() State.collectRemote:FireServer(id) end)
-        end
-    end)
-end
-
--- ============================================================
--- AUTO COLLECT
+-- AUTO COLLECT — CFrame teleport method
+-- source confirmed: server checks character proximity on heartbeat
+-- no remote needed — just get within CollectRadius studs
 -- ============================================================
 local function prioritySort(a, b)
     if State.priorityDiamond then
@@ -214,32 +177,57 @@ end
 local function autoCollectLoop()
     while State.autoCollect do
         if isAlive() then
-            local list = {}
-            for _, item in pairs(State.interceptedItems) do table.insert(list, item) end
-            table.sort(list, prioritySort)
-            for _, item in ipairs(list) do
-                if not State.autoCollect then break end
-                if not isAlive() then break end
-                local hum = getHum()
-                if distTo(item.position) > State.collectRadius and hum then
-                    hum:MoveTo(item.position)
-                    task.wait(0.25)
-                else
-                    if State.collectRemote then
-                        pcall(function() State.collectRemote:FireServer(item.id) end)
+            local root = getRoot()
+            if root then
+                -- build sorted list
+                local list = {}
+                for _, item in pairs(State.interceptedItems) do
+                    table.insert(list, item)
+                end
+                table.sort(list, prioritySort)
+
+                for _, item in ipairs(list) do
+                    if not State.autoCollect then break end
+                    if not isAlive() then break end
+
+                    root = getRoot()
+                    if not root then break end
+
+                    -- teleport directly onto item
+                    -- server heartbeat detects we're within CollectRadius
+                    root.CFrame = CFrame.new(item.position)
+
+                    -- wait 2 server ticks for collection to register
+                    task.wait(0.1)
+
+                    -- also fire any touch triggers on nearby ClientCollectibles parts
+                    local cc = Workspace:FindFirstChild("ClientCollectibles")
+                    if cc then
+                        for _, child in ipairs(cc:GetChildren()) do
+                            local part = child:IsA("BasePart") and child
+                                or child:FindFirstChildOfClass("BasePart")
+                            if part and (root.Position - part.Position).Magnitude < (State.collectRadius + 4) then
+                                pcall(firetouchinterest, root, part, 0)
+                                pcall(firetouchinterest, root, part, 1)
+                                local prompt = child:FindFirstChildOfClass("ProximityPrompt")
+                                    or child:FindFirstChild("ProximityPrompt", true)
+                                if prompt then pcall(fireproximityprompt, prompt) end
+                            end
+                        end
                     end
+
                     State.totalCollected = State.totalCollected + 1
                     State.interceptedItems[item.id] = nil
+                    task.wait(State.farmDelay)
                 end
-                task.wait(State.farmDelay)
             end
         end
-        task.wait(0.5)
+        task.wait(0.3)
     end
 end
 
 -- ============================================================
--- PRESTIGE (doc 43 confirmed: "Ascend" invoke)
+-- PRESTIGE
 -- ============================================================
 local function checkPrestige()
     if not PrestigeRequest then return false, 0 end
@@ -258,19 +246,16 @@ local function doPrestige()
         return PrestigeRequest:InvokeServer("Ascend")
     end)
     if ok and result then return true end
-    ok, result = pcall(function()
-        return PrestigeRequest:InvokeServer()
-    end)
+    ok, result = pcall(function() return PrestigeRequest:InvokeServer() end)
     return ok and result == true
 end
 
 local function autoPrestigeLoop()
     while State.autoPrestige do
-        local eligible = checkPrestige()
-        if eligible then
+        if checkPrestige() then
             if doPrestige() then
                 State.prestigeCount = State.prestigeCount + 1
-                notify("⚡ Prestiged!", "Prestige #"..State.prestigeCount.." complete", 4)
+                notify("⚡ Prestiged!", "Prestige #"..State.prestigeCount, 4)
                 print("[Axiom] Prestige #"..State.prestigeCount)
             end
         end
@@ -278,15 +263,12 @@ local function autoPrestigeLoop()
     end
 end
 
--- attribute watcher (doc 43)
 for _, attr in ipairs({"Face","Frame","HeightInches","BodyfatPercentage","PrestigeLevel","StatsLoaded"}) do
     LocalPlayer:GetAttributeChangedSignal(attr):Connect(function()
-        if State.autoPrestige then
-            if checkPrestige() then
-                if doPrestige() then
-                    State.prestigeCount = State.prestigeCount + 1
-                    notify("⚡ Prestiged!", "Prestige #"..State.prestigeCount, 4)
-                end
+        if State.autoPrestige and checkPrestige() then
+            if doPrestige() then
+                State.prestigeCount = State.prestigeCount + 1
+                notify("⚡ Prestiged!", "Prestige #"..State.prestigeCount, 4)
             end
         end
     end)
@@ -297,14 +279,13 @@ end
 -- ============================================================
 local function claimReward(i)
     if not ClaimPlaytimeReward then return false end
-    local ok = pcall(function()
+    return pcall(function()
         if ClaimPlaytimeReward:IsA("RemoteFunction") then
             ClaimPlaytimeReward:InvokeServer(i)
         else
             ClaimPlaytimeReward:FireServer(i)
         end
     end)
-    return ok
 end
 
 local function autoRewardsLoop()
@@ -381,10 +362,10 @@ local function scanBosses()
             local hum = obj:FindFirstChildOfClass("Humanoid")
             local hrp = obj:FindFirstChild("HumanoidRootPart")
             if hum and hrp and nameMatch(obj.Name, BOSS_FRAGS) then
-                local dist = (root.Position - hrp.Position).Magnitude
                 table.insert(found, {
                     model=obj, hrp=hrp, humanoid=hum, name=obj.Name,
-                    position=hrp.Position, distance=dist,
+                    position=hrp.Position,
+                    distance=(root.Position - hrp.Position).Magnitude,
                     health=hum.Health, maxHealth=hum.MaxHealth,
                 })
             end
@@ -396,7 +377,7 @@ end
 
 local function clearESP()
     for _, obj in ipairs(State.espObjects) do pcall(function() obj:Destroy() end) end
-    State.espObjects = {}
+    State.espObjects  = {}
     State.bossMarkers = {}
 end
 
@@ -413,8 +394,7 @@ local function buildESP(bosses)
         local hL = Instance.new("TextLabel",bb)
         hL.Size=UDim2.new(1,0,0.5,0); hL.Position=UDim2.new(0,0,0.5,0)
         hL.BackgroundTransparency=1; hL.TextColor3=Color3.fromRGB(100,255,100)
-        hL.TextStrokeTransparency=0; hL.Font=Enum.Font.Gotham
-        hL.TextScaled=true
+        hL.TextStrokeTransparency=0; hL.Font=Enum.Font.Gotham; hL.TextScaled=true
         hL.Text=string.format("HP %.0f/%.0f | %.0fst",boss.health,boss.maxHealth,boss.distance)
         local sel = Instance.new("SelectionBox")
         sel.Color3=Color3.fromRGB(255,50,50); sel.LineThickness=0.07
@@ -468,145 +448,125 @@ local function autoBossLoop()
 end
 
 -- ============================================================
--- RAYFIELD GEN1 WINDOW (confirmed working API)
+-- RAYFIELD WINDOW
 -- ============================================================
 local Window = Rayfield:CreateWindow({
-    Name                = "Axiom Hub  |  Mog or Die",
-    LoadingTitle        = "Axiom Hub",
-    LoadingSubtitle     = "v2.1 — All Systems",
-    Theme               = "Default",
+    Name                   = "Axiom Hub  |  Mog or Die",
+    LoadingTitle           = "Axiom Hub",
+    LoadingSubtitle        = "v2.2 — Collect Fixed",
+    Theme                  = "Default",
     DisableRayfieldPrompts = false,
-    ConfigurationSaving = { Enabled = false },
-    Discord             = { Enabled = false },
-    KeySystem           = false,
+    ConfigurationSaving    = { Enabled = false },
+    Discord                = { Enabled = false },
+    KeySystem              = false,
 })
 
--- ============================================================
 -- TAB 1 — COLLECT
--- ============================================================
 local CollectTab = Window:CreateTab("Collect", 6031071057)
 
 CollectTab:CreateToggle({
-    Name         = "Auto Collect",
-    CurrentValue = false,
-    Flag         = "AutoCollect",
-    Callback     = function(val)
+    Name = "Auto Collect", CurrentValue = false, Flag = "AutoCollect",
+    Callback = function(val)
         State.autoCollect = val
         if val then task.spawn(autoCollectLoop) end
-        notify("Auto Collect", val and "Farming started" or "Stopped", 2)
+        notify("Auto Collect", val and "Teleporting to items" or "Stopped", 2)
     end,
 })
 
 CollectTab:CreateToggle({
-    Name         = "Priority Diamond > Golden",
-    CurrentValue = true,
-    Flag         = "PriorityDiamond",
-    Callback     = function(val) State.priorityDiamond = val end,
+    Name = "Priority Diamond > Golden", CurrentValue = true, Flag = "PriorityDiamond",
+    Callback = function(val) State.priorityDiamond = val end,
 })
 
 CollectTab:CreateSlider({
-    Name         = "Collect Radius",
-    Range        = {4, 40},
-    Increment    = 1,
-    CurrentValue = 8,
-    Flag         = "CollectRadius",
-    Callback     = function(val) State.collectRadius = val end,
-})
-
-CollectTab:CreateSlider({
-    Name         = "Farm Delay (ms)",
-    Range        = {50, 1000},
-    Increment    = 10,
-    CurrentValue = 350,
-    Flag         = "FarmDelay",
-    Callback     = function(val) State.farmDelay = val / 1000 end,
+    Name = "Farm Delay (ms)", Range = {50, 800}, Increment = 10,
+    CurrentValue = 150, Flag = "FarmDelay",
+    Callback = function(val) State.farmDelay = val / 1000 end,
 })
 
 CollectTab:CreateButton({
-    Name     = "Dump Tracked Items",
+    Name = "Dump Tracked Items",
     Callback = function()
         local count = 0
         for _, item in pairs(State.interceptedItems) do
             count = count + 1
-            print(string.format("[Axiom] %s | %s | gold=%s dia=%s",
+            print(string.format("[Axiom] %s | %s | gold=%s dia=%s | pos=(%.1f,%.1f,%.1f)",
                 tostring(item.id), tostring(item.typeName),
-                tostring(item.golden), tostring(item.diamond)))
+                tostring(item.golden), tostring(item.diamond),
+                item.position.X, item.position.Y, item.position.Z))
         end
         notify("Item Dump", count.." items logged", 3)
     end,
 })
 
--- ============================================================
+CollectTab:CreateButton({
+    Name = "Reinstall Stream Hook",
+    Callback = function()
+        installInterceptor()
+        notify("Hook", "Reinstalled", 2)
+    end,
+})
+
 -- TAB 2 — PRESTIGE
--- ============================================================
 local PrestigeTab = Window:CreateTab("Prestige", 6031075938)
 
 PrestigeTab:CreateToggle({
-    Name         = "Auto Prestige",
-    CurrentValue = false,
-    Flag         = "AutoPrestige",
-    Callback     = function(val)
+    Name = "Auto Prestige", CurrentValue = false, Flag = "AutoPrestige",
+    Callback = function(val)
         State.autoPrestige = val
         if val then task.spawn(autoPrestigeLoop) end
-        notify("Auto Prestige", val and "Watching stats" or "Stopped", 3)
+        notify("Auto Prestige", val and "Watching" or "Stopped", 2)
     end,
 })
 
 PrestigeTab:CreateButton({
-    Name     = "Check Prestige Status",
+    Name = "Check Status",
     Callback = function()
         local eligible, progress = checkPrestige()
         local p = LocalPlayer
         local msg = string.format(
-            "Eligible: %s | Progress: %.0f%%\nFace:%.1f Frame:%.1f\nHeight:%.1f BF:%.1f",
+            "Eligible:%s Progress:%.0f%%\nFace:%.1f Frame:%.1f\nHeight:%.1f BF:%.1f",
             tostring(eligible), progress * 100,
             tonumber(p:GetAttribute("Face"))              or 0,
             tonumber(p:GetAttribute("Frame"))             or 0,
             tonumber(p:GetAttribute("HeightInches"))      or 0,
             tonumber(p:GetAttribute("BodyfatPercentage")) or 100
         )
-        print("[Axiom]\n"..msg)
-        notify("Prestige Status", msg, 6)
+        print("[Axiom Prestige]\n"..msg)
+        notify("Prestige", msg, 6)
     end,
 })
 
 PrestigeTab:CreateButton({
-    Name     = "Force Prestige Now",
+    Name = "Force Prestige Now",
     Callback = function()
-        local eligible = checkPrestige()
-        if eligible then
+        if checkPrestige() then
             if doPrestige() then
                 State.prestigeCount = State.prestigeCount + 1
-                notify("Prestiged!", "Prestige #"..State.prestigeCount, 4)
+                notify("Prestiged!", "#"..State.prestigeCount, 4)
             else
                 notify("Prestige", "Server rejected", 3)
             end
         else
-            notify("Prestige", "Not eligible yet", 3)
+            notify("Prestige", "Not eligible", 3)
         end
     end,
 })
 
--- ============================================================
 -- TAB 3 — BOSS
--- ============================================================
 local BossTab = Window:CreateTab("Boss", 6031068421)
 
 BossTab:CreateToggle({
-    Name         = "Boss ESP",
-    CurrentValue = false,
-    Flag         = "BossESP",
-    Callback     = function(val)
+    Name = "Boss ESP", CurrentValue = false, Flag = "BossESP",
+    Callback = function(val)
         State.bossESP = val
         if val then buildESP(scanBosses()) else clearESP() end
     end,
 })
 
 BossTab:CreateToggle({
-    Name         = "Auto Boss Fight",
-    CurrentValue = false,
-    Flag         = "AutoBoss",
-    Callback     = function(val)
+    Name = "Auto Boss Fight", CurrentValue = false, Flag = "AutoBoss",
+    Callback = function(val)
         State.autoBoss = val
         if val then task.spawn(autoBossLoop) end
         notify("Auto Boss", val and "Hunting" or "Stopped", 2)
@@ -614,7 +574,7 @@ BossTab:CreateToggle({
 })
 
 BossTab:CreateButton({
-    Name     = "Scan Bosses Now",
+    Name = "Scan Bosses Now",
     Callback = function()
         local bosses = scanBosses()
         if State.bossESP then buildESP(bosses) end
@@ -622,43 +582,36 @@ BossTab:CreateButton({
             print(string.format("[Axiom] Boss[%d] %s | %.0fHP | %.1fst",
                 i, b.name, b.health, b.distance))
         end
-        notify("Boss Scan", #bosses.." found — check console", 3)
+        notify("Boss Scan", #bosses.." found", 3)
     end,
 })
 
 BossTab:CreateButton({
-    Name     = "Clear ESP",
+    Name = "Clear ESP",
     Callback = function()
         clearESP(); State.bossESP = false
         notify("ESP", "Cleared", 2)
     end,
 })
 
--- ============================================================
 -- TAB 4 — TRAVEL
--- ============================================================
 local TravelTab = Window:CreateTab("Travel", 6031080504)
 
 local districtNames = {}
 for _, d in ipairs(Districts) do table.insert(districtNames, d.Name) end
 
 TravelTab:CreateDropdown({
-    Name    = "Target District",
-    Options = districtNames,
-    CurrentOption = "Starter District",
-    Flag    = "TargetDistrict",
+    Name = "Target District", Options = districtNames,
+    CurrentOption = "Starter District", Flag = "TargetDistrict",
     Callback = function(val)
         for _, d in ipairs(Districts) do
-            if d.Name == val then
-                State.targetDistrict = d.Id
-                break
-            end
+            if d.Name == val then State.targetDistrict = d.Id break end
         end
     end,
 })
 
 TravelTab:CreateButton({
-    Name     = "Travel Now",
+    Name = "Travel Now",
     Callback = function()
         local ok = travelToDistrict(State.targetDistrict)
         notify("Travel", ok and ("→ "..State.targetDistrict) or "Failed", 3)
@@ -666,26 +619,20 @@ TravelTab:CreateButton({
 })
 
 TravelTab:CreateToggle({
-    Name         = "Auto Travel",
-    CurrentValue = false,
-    Flag         = "AutoTravel",
-    Callback     = function(val)
+    Name = "Auto Travel", CurrentValue = false, Flag = "AutoTravel",
+    Callback = function(val)
         State.autoTravel = val
         if val then task.spawn(autoTravelLoop) end
         notify("Auto Travel", val and "Active" or "Stopped", 2)
     end,
 })
 
--- ============================================================
 -- TAB 5 — REWARDS
--- ============================================================
 local RewardsTab = Window:CreateTab("Rewards", 6031071057)
 
 RewardsTab:CreateToggle({
-    Name         = "Auto Claim Rewards",
-    CurrentValue = false,
-    Flag         = "AutoRewards",
-    Callback     = function(val)
+    Name = "Auto Claim Rewards", CurrentValue = false, Flag = "AutoRewards",
+    Callback = function(val)
         State.autoRewards = val
         if val then task.spawn(autoRewardsLoop) end
         notify("Auto Rewards", val and "Claiming" or "Stopped", 2)
@@ -693,7 +640,7 @@ RewardsTab:CreateToggle({
 })
 
 RewardsTab:CreateButton({
-    Name     = "Claim All Now",
+    Name = "Claim All Now",
     Callback = function()
         local claimed = 0
         for i = 1, 8 do
@@ -701,57 +648,37 @@ RewardsTab:CreateButton({
             task.wait(0.3)
         end
         State.rewardsClaimed = State.rewardsClaimed + claimed
-        notify("Rewards", "Attempted "..claimed.." claims", 3)
+        notify("Rewards", claimed.." claimed", 3)
     end,
 })
 
--- ============================================================
 -- TAB 6 — SETTINGS
--- ============================================================
 local SettingsTab = Window:CreateTab("Settings", 6031080504)
 
 SettingsTab:CreateButton({
-    Name     = "Session Report",
+    Name = "Session Report",
     Callback = function()
         local tracked = 0
         for _ in pairs(State.interceptedItems) do tracked = tracked + 1 end
         local msg = string.format(
-            "Collected:%d | Tracked:%d\nPrestige:%d | Rewards:%d\nFarm:%s Boss:%s",
+            "Collected:%d Tracked:%d\nPrestige:%d Rewards:%d\nFarm:%s Boss:%s",
             State.totalCollected, tracked,
             State.prestigeCount, State.rewardsClaimed,
             State.autoCollect and "ON" or "OFF",
             State.autoBoss    and "ON" or "OFF"
         )
         print("[Axiom]\n"..msg)
-        notify("Session Report", msg, 6)
+        notify("Session", msg, 6)
     end,
 })
 
 SettingsTab:CreateButton({
-    Name     = "Reinstall Stream Hook",
-    Callback = function()
-        installInterceptor()
-        notify("Hook", "Interceptor reinstalled", 3)
-    end,
-})
-
-SettingsTab:CreateButton({
-    Name     = "Re-Scan Collect Remote",
-    Callback = function()
-        findCollectRemote()
-        notify("Remote", State.collectRemote
-            and ("Found: "..State.collectRemote.Name)
-            or "Not found", 3)
-    end,
-})
-
-SettingsTab:CreateButton({
-    Name     = "Cooldown Status",
+    Name = "Cooldown Status",
     Callback = function()
         local rem = math.max(State.cooldownEndsAt - Workspace:GetServerTimeNow(), 0)
-        notify("Battle Cooldown",
-            State.battleCooldown and string.format("%.1fs remaining", rem) or "Clear — ready",
-            4)
+        notify("Cooldown",
+            State.battleCooldown and string.format("%.1fs left", rem) or "Clear",
+            3)
     end,
 })
 
@@ -765,4 +692,4 @@ LocalPlayer.CharacterAdded:Connect(function()
     notify("Respawned", "Re-enable toggles", 3)
 end)
 
-print("[AxiomHub v2.1] Loaded — Rayfield:Notify confirmed working")
+print("[AxiomHub v2.2] Loaded — CFrame collect active")
