@@ -1,452 +1,345 @@
 -- ============================================================
---  MOG OR DIE — AXIOM HUB v2.3
---  FIX: correct action names "spawned" + "chunks"
---  FIX: spawned sends args differently — handled below
+--  SILENT ASSASSINS — AXIOM HUB
+--  ESP + Auto Dodge
 -- ============================================================
 
 local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
 
-local Players           = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local RunService        = game:GetService("RunService")
-local Workspace         = game:GetService("Workspace")
+local Players        = game:GetService("Players")
+local RunService     = game:GetService("RunService")
+local Workspace      = game:GetService("Workspace")
+local UserInputService = game:GetService("UserInputService")
 
 local LocalPlayer = Players.LocalPlayer
 
-local MogOrDie            = ReplicatedStorage:WaitForChild("MogOrDie", 15)
-local Config              = require(MogOrDie:WaitForChild("Config"))
-local CollectibleStream   = MogOrDie:WaitForChild("CollectibleStream", 10)
-local WorldTravelRequest  = MogOrDie:WaitForChild("WorldTravelRequest", 10)
-local ClaimPlaytimeReward = MogOrDie:WaitForChild("ClaimPlaytimeReward", 10)
-local PlaytimeRewardEvent = MogOrDie:WaitForChild("PlaytimeRewardEvent", 10)
-local MogBattleEvent      = MogOrDie:WaitForChild("MogBattleEvent", 10)
-local PrestigeRequest     = MogOrDie:WaitForChild("PrestigeRequest", 10)
-
 -- ============================================================
--- SORTED TYPE ARRAY
+-- STATE
 -- ============================================================
-local SortedTypes = {}
-for typeName in Config.Collectibles do
-    table.insert(SortedTypes, typeName)
-end
-table.sort(SortedTypes)
-
-local Districts = {
-    { Id = "StarterDistrict", Name = "Starter District" },
-    { Id = "Downtown",        Name = "Downtown"         },
-    { Id = "MogDistrict",     Name = "Mog District"     },
-    { Id = "Heaven",          Name = "Heaven"           },
-    { Id = "Hell",            Name = "Hell"             },
-    { Id = "Agartha",         Name = "Agartha"          },
-}
-
 local State = {
-    autoCollect      = false,
-    totalCollected   = 0,
-    collectRadius    = Config.Spawning and Config.Spawning.CollectRadius or 8,
-    farmDelay        = 0.15,
-    priorityDiamond  = true,
-    interceptedItems = {},
-    autoBoss         = false,
-    bossESP          = false,
-    espObjects       = {},
-    bossMarkers      = {},
-    autoPrestige     = false,
-    prestigeCount    = 0,
-    autoRewards      = false,
-    rewardsClaimed   = 0,
-    autoTravel       = false,
-    targetDistrict   = "StarterDistrict",
-    battleCooldown   = false,
-    cooldownEndsAt   = 0,
+    espEnabled      = false,
+    autoDodge       = false,
+    dodgeRadius     = 20,
+    espObjects      = {},
+    showDistance    = true,
+    showName        = true,
+    showHealth      = true,
+    showWeapon      = true,
+    espTeamCheck    = false,
+    dodgeCooldown   = false,
+    totalDodges     = 0,
 }
 
+-- ============================================================
+-- NOTIFY
+-- ============================================================
 local function notify(title, content, duration)
     pcall(function()
         Rayfield:Notify({
-            Title = title, Content = content,
-            Duration = duration or 3, Image = 4483362458,
+            Title    = title,
+            Content  = content,
+            Duration = duration or 3,
+            Image    = 4483362458,
         })
     end)
 end
 
+-- ============================================================
+-- UTILITY
+-- ============================================================
 local function getRoot()
     local c = LocalPlayer.Character
     return c and c:FindFirstChild("HumanoidRootPart")
 end
+
 local function getHum()
     local c = LocalPlayer.Character
     return c and c:FindFirstChildOfClass("Humanoid")
 end
+
 local function isAlive()
     local h = getHum()
     return h and h.Health > 0
 end
-local function distTo(pos)
-    local r = getRoot()
-    return r and (r.Position - pos).Magnitude or math.huge
+
+local function distTo(hrp)
+    local root = getRoot()
+    if not root or not hrp then return math.huge end
+    return (root.Position - hrp.Position).Magnitude
 end
-local function nameMatch(name, frags)
-    local low = name:lower()
-    for _, f in ipairs(frags) do
-        if low:find(f, 1, true) then return true end
+
+local function getWeapon(char)
+    for _, obj in ipairs(char:GetChildren()) do
+        if obj:IsA("Tool") then return obj.Name end
     end
-    return false
+    return "None"
+end
+
+local function getTeam(player)
+    return player.Team and tostring(player.Team.Name) or "None"
+end
+
+local function isSameTeam(player)
+    if not State.espTeamCheck then return false end
+    return LocalPlayer.Team and player.Team == LocalPlayer.Team
 end
 
 -- ============================================================
--- REGISTER ITEM — shared between spawned + chunks handlers
--- confirmed payload: [1]=id [2]=typeIdx [3]=X [4]=Y [5]=Z
---                   [6]=golden [7]=diamond [8]=agartha
+-- ESP COLORS
 -- ============================================================
-local function registerItem(p)
-    if type(p) ~= "table" then return end
-    local id = p[1]
-    if not id then return end
-    State.interceptedItems[id] = {
-        id       = id,
-        typeName = SortedTypes[p[2]],
-        position = Vector3.new(p[3] or 0, p[4] or 0, p[5] or 0),
-        golden   = p[6] == 1,
-        diamond  = p[7] == 1,
-        agartha  = p[8] == 1,
-        t        = os.clock(),
-    }
-end
-
--- ============================================================
--- STREAM INTERCEPTOR — corrected action names
--- ============================================================
-local function installInterceptor()
-    for _, conn in getconnections(CollectibleStream.OnClientEvent) do
-        local old; old = hookfunction(conn.Function, function(...)
-            local raw    = { ... }
-            local action = raw[1]
-
-            if action == "spawned" then
-                -- spawned sends: "spawned", chunkKey, itemTable
-                -- raw[2] = chunkKey (string like "209:201")
-                -- raw[3] = item payload table
-                local p = raw[3]
-                if type(p) == "table" then
-                    registerItem(p)
-                else
-                    -- fallback: maybe raw[2] IS the item
-                    registerItem(raw[2])
-                end
-
-            elseif action == "chunks" then
-                -- chunks sends: "chunks", { [chunkKey] = { item, item, ... } }
-                local batch = raw[2]
-                if type(batch) == "table" then
-                    for _, items in pairs(batch) do
-                        if type(items) == "table" then
-                            for _, p in ipairs(items) do
-                                registerItem(p)
-                            end
-                        end
-                    end
-                end
-
-            elseif action == "collected" or action == "remove" then
-                -- item was collected — remove from registry
-                local id = raw[2]
-                if id then State.interceptedItems[id] = nil end
-            end
-
-            return old(...)
-        end)
+local function getESPColor(player)
+    if isSameTeam(player) then
+        return Color3.fromRGB(50, 200, 50)   -- green = teammate
     end
-    print("[Axiom] Interceptor v2.3 installed — watching spawned + chunks")
-end
-installInterceptor()
-
--- ============================================================
--- AUTO COLLECT — CFrame teleport
--- ============================================================
-local function prioritySort(a, b)
-    if State.priorityDiamond then
-        if a.diamond ~= b.diamond then return a.diamond end
-        if a.golden  ~= b.golden  then return a.golden  end
-    end
-    return distTo(a.position) < distTo(b.position)
-end
-
-local function autoCollectLoop()
-    while State.autoCollect do
-        if isAlive() then
-            local root = getRoot()
-            if root then
-                local list = {}
-                for _, item in pairs(State.interceptedItems) do
-                    table.insert(list, item)
-                end
-                table.sort(list, prioritySort)
-
-                for _, item in ipairs(list) do
-                    if not State.autoCollect then break end
-                    if not isAlive() then break end
-                    root = getRoot()
-                    if not root then break end
-
-                    -- teleport directly onto item
-                    root.CFrame = CFrame.new(item.position)
-                    task.wait(0.1)
-
-                    -- fire touch triggers on nearby parts
-                    local cc = Workspace:FindFirstChild("ClientCollectibles")
-                    if cc then
-                        for _, child in ipairs(cc:GetChildren()) do
-                            local part = child:IsA("BasePart") and child
-                                or child:FindFirstChildOfClass("BasePart")
-                            if part and (root.Position - part.Position).Magnitude < (State.collectRadius + 4) then
-                                pcall(firetouchinterest, root, part, 0)
-                                pcall(firetouchinterest, root, part, 1)
-                                local prompt = child:FindFirstChildOfClass("ProximityPrompt")
-                                    or child:FindFirstChild("ProximityPrompt", true)
-                                if prompt then pcall(fireproximityprompt, prompt) end
-                            end
-                        end
-                    end
-
-                    State.totalCollected = State.totalCollected + 1
-                    State.interceptedItems[item.id] = nil
-                    task.wait(State.farmDelay)
-                end
-            end
-        end
-        task.wait(0.3)
-    end
-end
-
--- ============================================================
--- PRESTIGE
--- ============================================================
-local function checkPrestige()
-    if not PrestigeRequest then return false, 0 end
-    local ok, result = pcall(function()
-        return PrestigeRequest:InvokeServer("Status")
-    end)
-    if ok and type(result) == "table" then
-        return result.Eligible == true, tonumber(result.Requirement) or 0
-    end
-    return false, 0
-end
-
-local function doPrestige()
-    if not PrestigeRequest then return false end
-    local ok, result = pcall(function()
-        return PrestigeRequest:InvokeServer("Ascend")
-    end)
-    if ok and result then return true end
-    ok, result = pcall(function() return PrestigeRequest:InvokeServer() end)
-    return ok and result == true
-end
-
-local function autoPrestigeLoop()
-    while State.autoPrestige do
-        if checkPrestige() then
-            if doPrestige() then
-                State.prestigeCount = State.prestigeCount + 1
-                notify("⚡ Prestiged!", "Prestige #"..State.prestigeCount, 4)
-                print("[Axiom] Prestige #"..State.prestigeCount)
-            end
-        end
-        task.wait(5)
-    end
-end
-
-for _, attr in ipairs({"Face","Frame","HeightInches","BodyfatPercentage","PrestigeLevel","StatsLoaded"}) do
-    LocalPlayer:GetAttributeChangedSignal(attr):Connect(function()
-        if State.autoPrestige and checkPrestige() then
-            if doPrestige() then
-                State.prestigeCount = State.prestigeCount + 1
-                notify("⚡ Prestiged!", "Prestige #"..State.prestigeCount, 4)
-            end
-        end
-    end)
-end
-
--- ============================================================
--- PLAYTIME REWARDS
--- ============================================================
-local function claimReward(i)
-    if not ClaimPlaytimeReward then return false end
-    return pcall(function()
-        if ClaimPlaytimeReward:IsA("RemoteFunction") then
-            ClaimPlaytimeReward:InvokeServer(i)
+    local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+    if hum then
+        local hp = hum.Health / hum.MaxHealth
+        if hp > 0.6 then
+            return Color3.fromRGB(255, 50, 50)   -- red = healthy enemy
+        elseif hp > 0.3 then
+            return Color3.fromRGB(255, 165, 0)   -- orange = damaged
         else
-            ClaimPlaytimeReward:FireServer(i)
-        end
-    end)
-end
-
-local function autoRewardsLoop()
-    while State.autoRewards do
-        for i = 1, 8 do
-            if not State.autoRewards then break end
-            claimReward(i)
-            task.wait(0.5)
-        end
-        task.wait(15)
-    end
-end
-
-if PlaytimeRewardEvent then
-    PlaytimeRewardEvent.OnClientEvent:Connect(function()
-        if State.autoRewards then
-            for i = 1, 8 do pcall(function() claimReward(i) end) end
-        end
-    end)
-end
-
--- ============================================================
--- WORLD TRAVEL
--- ============================================================
-local function travelToDistrict(id)
-    if not WorldTravelRequest then return false end
-    return pcall(function()
-        if WorldTravelRequest:IsA("RemoteFunction") then
-            WorldTravelRequest:InvokeServer(id)
-        else
-            WorldTravelRequest:FireServer(id)
-        end
-    end)
-end
-
-local function autoTravelLoop()
-    while State.autoTravel do
-        if not State.battleCooldown then
-            travelToDistrict(State.targetDistrict)
-        end
-        task.wait(30)
-    end
-end
-
--- ============================================================
--- BATTLE COOLDOWN
--- ============================================================
-if MogBattleEvent then
-    MogBattleEvent.OnClientEvent:Connect(function(data)
-        if type(data) == "table" and data.Phase == "BattleCooldown" then
-            local remaining = tonumber(data.Remaining) or 0
-            State.battleCooldown = remaining > 0
-            State.cooldownEndsAt = tonumber(data.EndsAt)
-                or (Workspace:GetServerTimeNow() + remaining)
-            if remaining > 0 then
-                task.delay(remaining + 0.5, function()
-                    State.battleCooldown = false
-                end)
-            end
-        end
-    end)
-end
-
--- ============================================================
--- BOSS
--- ============================================================
-local BOSS_FRAGS = {"boss","mogking","king","elite","alpha","giant","champion","titan","mogger"}
-
-local function scanBosses()
-    local found, root = {}, getRoot()
-    if not root then return found end
-    for _, obj in ipairs(Workspace:GetDescendants()) do
-        if obj:IsA("Model") and obj ~= LocalPlayer.Character then
-            local hum = obj:FindFirstChildOfClass("Humanoid")
-            local hrp = obj:FindFirstChild("HumanoidRootPart")
-            if hum and hrp and nameMatch(obj.Name, BOSS_FRAGS) then
-                table.insert(found, {
-                    model=obj, hrp=hrp, humanoid=hum, name=obj.Name,
-                    position=hrp.Position,
-                    distance=(root.Position - hrp.Position).Magnitude,
-                    health=hum.Health, maxHealth=hum.MaxHealth,
-                })
-            end
+            return Color3.fromRGB(255, 255, 50)  -- yellow = low hp
         end
     end
-    table.sort(found, function(a,b) return a.distance < b.distance end)
-    return found
+    return Color3.fromRGB(255, 50, 50)
 end
 
+-- ============================================================
+-- ESP BUILD
+-- ============================================================
 local function clearESP()
-    for _, obj in ipairs(State.espObjects) do pcall(function() obj:Destroy() end) end
-    State.espObjects  = {}
-    State.bossMarkers = {}
+    for _, obj in ipairs(State.espObjects) do
+        pcall(function() obj:Destroy() end)
+    end
+    State.espObjects = {}
 end
 
-local function buildESP(bosses)
+local function buildPlayerESP(player)
+    if player == LocalPlayer then return end
+    local char = player.Character
+    if not char then return end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hrp or not hum then return end
+
+    -- BillboardGui
+    local bb = Instance.new("BillboardGui")
+    bb.Name         = "AxiomESP_"..player.Name
+    bb.AlwaysOnTop  = true
+    bb.Size         = UDim2.new(0, 200, 0, 80)
+    bb.StudsOffset  = Vector3.new(0, 3, 0)
+    bb.Adornee      = hrp
+    bb.Parent       = game.CoreGui
+
+    -- Name label
+    local nameL = Instance.new("TextLabel", bb)
+    nameL.Name                   = "NameLabel"
+    nameL.Size                   = UDim2.new(1, 0, 0.35, 0)
+    nameL.BackgroundTransparency = 1
+    nameL.TextColor3             = getESPColor(player)
+    nameL.TextStrokeTransparency = 0
+    nameL.TextStrokeColor3       = Color3.new(0, 0, 0)
+    nameL.Font                   = Enum.Font.GothamBold
+    nameL.TextScaled             = true
+    nameL.Text                   = State.showName and player.Name or ""
+
+    -- HP label
+    local hpL = Instance.new("TextLabel", bb)
+    hpL.Name                   = "HPLabel"
+    hpL.Size                   = UDim2.new(1, 0, 0.3, 0)
+    hpL.Position               = UDim2.new(0, 0, 0.35, 0)
+    hpL.BackgroundTransparency = 1
+    hpL.TextColor3             = Color3.fromRGB(100, 255, 100)
+    hpL.TextStrokeTransparency = 0
+    hpL.TextStrokeColor3       = Color3.new(0, 0, 0)
+    hpL.Font                   = Enum.Font.Gotham
+    hpL.TextScaled             = true
+    hpL.Text                   = State.showHealth
+        and string.format("HP: %.0f/%.0f", hum.Health, hum.MaxHealth) or ""
+
+    -- Weapon + Distance label
+    local infoL = Instance.new("TextLabel", bb)
+    infoL.Name                   = "InfoLabel"
+    infoL.Size                   = UDim2.new(1, 0, 0.3, 0)
+    infoL.Position               = UDim2.new(0, 0, 0.65, 0)
+    infoL.BackgroundTransparency = 1
+    infoL.TextColor3             = Color3.fromRGB(200, 200, 255)
+    infoL.TextStrokeTransparency = 0
+    infoL.TextStrokeColor3       = Color3.new(0, 0, 0)
+    infoL.Font                   = Enum.Font.Gotham
+    infoL.TextScaled             = true
+    infoL.Text                   = ""
+
+    -- SelectionBox highlight
+    local highlight = Instance.new("SelectionBox")
+    highlight.Name              = "AxiomHighlight_"..player.Name
+    highlight.Color3            = getESPColor(player)
+    highlight.LineThickness     = 0.06
+    highlight.SurfaceTransparency = 0.8
+    highlight.SurfaceColor3    = getESPColor(player)
+    highlight.Adornee          = char
+    highlight.Parent           = game.CoreGui
+
+    table.insert(State.espObjects, bb)
+    table.insert(State.espObjects, highlight)
+end
+
+local function refreshESP()
     clearESP()
-    for _, boss in ipairs(bosses) do
-        local bb = Instance.new("BillboardGui")
-        bb.AlwaysOnTop=true; bb.Size=UDim2.new(0,220,0,65)
-        bb.StudsOffset=Vector3.new(0,5,0); bb.Adornee=boss.hrp; bb.Parent=game.CoreGui
-        local nL = Instance.new("TextLabel",bb)
-        nL.Size=UDim2.new(1,0,0.5,0); nL.BackgroundTransparency=1
-        nL.TextColor3=Color3.fromRGB(255,220,50); nL.TextStrokeTransparency=0
-        nL.Font=Enum.Font.GothamBold; nL.TextScaled=true; nL.Text="⚠ "..boss.name
-        local hL = Instance.new("TextLabel",bb)
-        hL.Size=UDim2.new(1,0,0.5,0); hL.Position=UDim2.new(0,0,0.5,0)
-        hL.BackgroundTransparency=1; hL.TextColor3=Color3.fromRGB(100,255,100)
-        hL.TextStrokeTransparency=0; hL.Font=Enum.Font.Gotham; hL.TextScaled=true
-        hL.Text=string.format("HP %.0f/%.0f | %.0fst",boss.health,boss.maxHealth,boss.distance)
-        local sel = Instance.new("SelectionBox")
-        sel.Color3=Color3.fromRGB(255,50,50); sel.LineThickness=0.07
-        sel.SurfaceTransparency=0.75; sel.SurfaceColor3=Color3.fromRGB(255,50,50)
-        sel.Adornee=boss.model; sel.Parent=game.CoreGui
-        table.insert(State.espObjects, bb)
-        table.insert(State.espObjects, sel)
-        table.insert(State.bossMarkers, {boss=boss, hpLabel=hL})
+    if not State.espEnabled then return end
+    for _, player in ipairs(Players:GetPlayers()) do
+        pcall(function() buildPlayerESP(player) end)
     end
 end
 
+-- ============================================================
+-- ESP UPDATE LOOP (Heartbeat)
+-- ============================================================
 RunService.Heartbeat:Connect(function()
-    if not State.bossESP then return end
-    for _, e in ipairs(State.bossMarkers) do
-        local b = e.boss
-        if b.humanoid and b.hrp then
-            e.hpLabel.Text = string.format("HP %.0f/%.0f | %.0fst",
-                b.humanoid.Health, b.humanoid.MaxHealth, distTo(b.hrp.Position))
+    if not State.espEnabled then return end
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player == LocalPlayer then continue end
+        local char = player.Character
+        if not char then continue end
+        local hrp = char:FindFirstChild("HumanoidRootPart")
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if not hrp or not hum then continue end
+
+        -- find this player's billboard
+        local bb = game.CoreGui:FindFirstChild("AxiomESP_"..player.Name)
+        if not bb then
+            -- player joined mid-session, build their ESP
+            pcall(function() buildPlayerESP(player) end)
+            continue
+        end
+
+        local dist = distTo(hrp)
+        local col  = getESPColor(player)
+        local weapon = getWeapon(char)
+
+        local nameL = bb:FindFirstChild("NameLabel")
+        local hpL   = bb:FindFirstChild("HPLabel")
+        local infoL = bb:FindFirstChild("InfoLabel")
+
+        if nameL then
+            nameL.Text       = State.showName and player.Name or ""
+            nameL.TextColor3 = col
+        end
+        if hpL then
+            hpL.Text = State.showHealth
+                and string.format("HP: %.0f/%.0f", hum.Health, hum.MaxHealth) or ""
+            -- color shifts red as hp drops
+            local ratio = math.clamp(hum.Health / hum.MaxHealth, 0, 1)
+            hpL.TextColor3 = Color3.fromRGB(
+                math.floor((1 - ratio) * 255),
+                math.floor(ratio * 220),
+                50
+            )
+        end
+        if infoL then
+            local parts = {}
+            if State.showWeapon   then table.insert(parts, "🗡 "..weapon) end
+            if State.showDistance then table.insert(parts, string.format("%.0fst", dist)) end
+            infoL.Text = table.concat(parts, "  |  ")
+        end
+
+        -- update highlight color
+        local hl = game.CoreGui:FindFirstChild("AxiomHighlight_"..player.Name)
+        if hl then
+            hl.Color3        = col
+            hl.SurfaceColor3 = col
         end
     end
 end)
 
-local function autoBossLoop()
-    while State.autoBoss do
-        if isAlive() and not State.battleCooldown then
-            local bosses = scanBosses()
-            if #bosses > 0 then
-                local target = bosses[1]
-                local root   = getRoot()
-                while State.autoBoss and isAlive() and target.humanoid.Health > 0 do
-                    if distTo(target.hrp.Position) > 8 then
-                        local hum = getHum()
-                        if hum then hum:MoveTo(target.hrp.Position) end
-                    else
-                        pcall(firetouchinterest, root, target.hrp, 0)
-                        pcall(firetouchinterest, root, target.hrp, 1)
-                        local prompt = target.model:FindFirstChildOfClass("ProximityPrompt")
-                            or target.model:FindFirstChild("ProximityPrompt", true)
-                        if prompt then pcall(fireproximityprompt, prompt) end
-                        local cd = target.model:FindFirstChildOfClass("ClickDetector")
-                            or target.model:FindFirstChild("ClickDetector", true)
-                        if cd then pcall(fireclickdetector, cd) end
-                        task.wait(1)
-                    end
-                    task.wait(0.05)
-                end
-            end
-        end
+-- clean up when players leave
+Players.PlayerRemoving:Connect(function(player)
+    local bb = game.CoreGui:FindFirstChild("AxiomESP_"..player.Name)
+    local hl = game.CoreGui:FindFirstChild("AxiomHighlight_"..player.Name)
+    if bb then bb:Destroy() end
+    if hl then hl:Destroy() end
+end)
+
+-- build ESP for players who join mid-session
+Players.PlayerAdded:Connect(function(player)
+    player.CharacterAdded:Connect(function()
         task.wait(1)
+        if State.espEnabled then
+            pcall(function() buildPlayerESP(player) end)
+        end
+    end)
+end)
+
+-- ============================================================
+-- AUTO DODGE
+-- logic: scan all players every heartbeat
+-- if any enemy is within dodgeRadius AND moving toward us fast,
+-- teleport perpendicular to their velocity to dodge
+-- ============================================================
+local lastPositions = {}
+
+RunService.Heartbeat:Connect(function()
+    if not State.autoDodge then return end
+    if not isAlive() then return end
+    if State.dodgeCooldown then return end
+
+    local root = getRoot()
+    if not root then return end
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player == LocalPlayer then continue end
+        if isSameTeam(player) then continue end
+
+        local char = player.Character
+        if not char then continue end
+        local hrp = char:FindFirstChild("HumanoidRootPart")
+        if not hrp then continue end
+
+        local dist = distTo(hrp)
+        if dist > State.dodgeRadius then continue end
+
+        -- track velocity toward us
+        local lastPos = lastPositions[player.Name]
+        lastPositions[player.Name] = hrp.Position
+
+        if not lastPos then continue end
+
+        local enemyVelocity = hrp.Position - lastPos
+        local toUs          = root.Position - hrp.Position
+        local approaching   = enemyVelocity:Dot(toUs.Unit)
+
+        -- if enemy is moving toward us at speed > 1 stud/frame
+        if approaching > 1 and dist < State.dodgeRadius then
+            State.dodgeCooldown = true
+            State.totalDodges   = State.totalDodges + 1
+
+            -- calculate perpendicular dodge direction
+            local right     = root.CFrame.RightVector
+            local dodgeDir  = math.random(0, 1) == 0 and right or -right
+            local dodgePos  = root.Position + (dodgeDir * 18) + Vector3.new(0, 0.5, 0)
+
+            -- teleport dodge
+            root.CFrame = CFrame.new(dodgePos)
+
+            print(string.format("[Axiom] Dodged %s | total dodges: %d", player.Name, State.totalDodges))
+
+            -- cooldown between dodges
+            task.delay(0.6, function()
+                State.dodgeCooldown = false
+            end)
+            break
+        end
     end
-end
+end)
 
 -- ============================================================
 -- RAYFIELD WINDOW
 -- ============================================================
 local Window = Rayfield:CreateWindow({
-    Name                   = "Axiom Hub  |  Mog or Die",
+    Name                   = "Axiom Hub  |  Silent Assassins",
     LoadingTitle           = "Axiom Hub",
-    LoadingSubtitle        = "v2.3 — Stream Fixed",
+    LoadingSubtitle        = "ESP + Auto Dodge",
     Theme                  = "Default",
     DisableRayfieldPrompts = false,
     ConfigurationSaving    = { Enabled = false },
@@ -454,231 +347,143 @@ local Window = Rayfield:CreateWindow({
     KeySystem              = false,
 })
 
--- TAB 1 — COLLECT
-local CollectTab = Window:CreateTab("Collect", 6031071057)
+-- ============================================================
+-- TAB 1 — ESP
+-- ============================================================
+local ESPTab = Window:CreateTab("ESP", 6031071057)
 
-CollectTab:CreateToggle({
-    Name = "Auto Collect", CurrentValue = false, Flag = "AutoCollect",
+ESPTab:CreateToggle({
+    Name = "Enable ESP", CurrentValue = false, Flag = "ESPEnabled",
     Callback = function(val)
-        State.autoCollect = val
-        if val then task.spawn(autoCollectLoop) end
-        notify("Auto Collect", val and "Teleporting to items" or "Stopped", 2)
+        State.espEnabled = val
+        if val then refreshESP() else clearESP() end
+        notify("ESP", val and "Active" or "Off", 2)
     end,
 })
 
-CollectTab:CreateToggle({
-    Name = "Priority Diamond > Golden", CurrentValue = true, Flag = "PriorityDiamond",
-    Callback = function(val) State.priorityDiamond = val end,
+ESPTab:CreateToggle({
+    Name = "Show Name", CurrentValue = true, Flag = "ShowName",
+    Callback = function(val) State.showName = val end,
 })
 
-CollectTab:CreateSlider({
-    Name = "Farm Delay (ms)", Range = {50, 800}, Increment = 10,
-    CurrentValue = 150, Flag = "FarmDelay",
-    Callback = function(val) State.farmDelay = val / 1000 end,
+ESPTab:CreateToggle({
+    Name = "Show Health", CurrentValue = true, Flag = "ShowHealth",
+    Callback = function(val) State.showHealth = val end,
 })
 
-CollectTab:CreateButton({
-    Name = "Dump Tracked Items",
-    Callback = function()
-        local count = 0
-        for _, item in pairs(State.interceptedItems) do
-            count = count + 1
-            print(string.format("[Axiom] %s | %s | gold=%s dia=%s | (%.1f,%.1f,%.1f)",
-                tostring(item.id), tostring(item.typeName),
-                tostring(item.golden), tostring(item.diamond),
-                item.position.X, item.position.Y, item.position.Z))
-        end
-        notify("Item Dump", count.." items tracked", 3)
-    end,
+ESPTab:CreateToggle({
+    Name = "Show Weapon", CurrentValue = true, Flag = "ShowWeapon",
+    Callback = function(val) State.showWeapon = val end,
 })
 
-CollectTab:CreateButton({
-    Name = "Reinstall Hook",
-    Callback = function()
-        installInterceptor()
-        notify("Hook", "Reinstalled", 2)
-    end,
+ESPTab:CreateToggle({
+    Name = "Show Distance", CurrentValue = true, Flag = "ShowDist",
+    Callback = function(val) State.showDistance = val end,
 })
 
--- TAB 2 — PRESTIGE
-local PrestigeTab = Window:CreateTab("Prestige", 6031075938)
-
-PrestigeTab:CreateToggle({
-    Name = "Auto Prestige", CurrentValue = false, Flag = "AutoPrestige",
+ESPTab:CreateToggle({
+    Name = "Team Check (skip teammates)", CurrentValue = false, Flag = "TeamCheck",
     Callback = function(val)
-        State.autoPrestige = val
-        if val then task.spawn(autoPrestigeLoop) end
-        notify("Auto Prestige", val and "Watching" or "Stopped", 2)
+        State.espTeamCheck = val
+        if State.espEnabled then refreshESP() end
     end,
 })
 
-PrestigeTab:CreateButton({
-    Name = "Check Status",
+ESPTab:CreateButton({
+    Name = "Refresh ESP",
     Callback = function()
-        local eligible, progress = checkPrestige()
-        local p = LocalPlayer
-        local msg = string.format(
-            "Eligible:%s Progress:%.0f%%\nFace:%.1f Frame:%.1f\nHeight:%.1f BF:%.1f",
-            tostring(eligible), progress * 100,
-            tonumber(p:GetAttribute("Face"))              or 0,
-            tonumber(p:GetAttribute("Frame"))             or 0,
-            tonumber(p:GetAttribute("HeightInches"))      or 0,
-            tonumber(p:GetAttribute("BodyfatPercentage")) or 100
-        )
-        print("[Axiom Prestige]\n"..msg)
-        notify("Prestige", msg, 6)
+        refreshESP()
+        notify("ESP", "Refreshed", 2)
     end,
 })
 
-PrestigeTab:CreateButton({
-    Name = "Force Prestige Now",
+ESPTab:CreateButton({
+    Name = "List All Players",
     Callback = function()
-        if checkPrestige() then
-            if doPrestige() then
-                State.prestigeCount = State.prestigeCount + 1
-                notify("Prestiged!", "#"..State.prestigeCount, 4)
-            else
-                notify("Prestige", "Server rejected", 3)
+        local root = getRoot()
+        print("=== PLAYER LIST ===")
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= LocalPlayer then
+                local char = p.Character
+                local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+                local hum  = char and char:FindFirstChildOfClass("Humanoid")
+                local dist = hrp and root and (root.Position - hrp.Position).Magnitude or -1
+                print(string.format("  %s | Team:%s | HP:%.0f | %.0fst",
+                    p.Name, getTeam(p),
+                    hum and hum.Health or 0,
+                    dist))
             end
-        else
-            notify("Prestige", "Not eligible", 3)
         end
+        notify("Players", #Players:GetPlayers()-1 .." enemies listed", 3)
     end,
 })
 
--- TAB 3 — BOSS
-local BossTab = Window:CreateTab("Boss", 6031068421)
+-- ============================================================
+-- TAB 2 — DODGE
+-- ============================================================
+local DodgeTab = Window:CreateTab("Auto Dodge", 6031068421)
 
-BossTab:CreateToggle({
-    Name = "Boss ESP", CurrentValue = false, Flag = "BossESP",
+DodgeTab:CreateToggle({
+    Name = "Auto Dodge", CurrentValue = false, Flag = "AutoDodge",
     Callback = function(val)
-        State.bossESP = val
-        if val then buildESP(scanBosses()) else clearESP() end
+        State.autoDodge = val
+        notify("Auto Dodge", val and "Active — watching enemies" or "Off", 2)
     end,
 })
 
-BossTab:CreateToggle({
-    Name = "Auto Boss Fight", CurrentValue = false, Flag = "AutoBoss",
-    Callback = function(val)
-        State.autoBoss = val
-        if val then task.spawn(autoBossLoop) end
-        notify("Auto Boss", val and "Hunting" or "Stopped", 2)
-    end,
+DodgeTab:CreateSlider({
+    Name = "Dodge Trigger Radius (studs)",
+    Range = {8, 60}, Increment = 1, CurrentValue = 20,
+    Flag = "DodgeRadius",
+    Callback = function(val) State.dodgeRadius = val end,
 })
 
-BossTab:CreateButton({
-    Name = "Scan Bosses Now",
+DodgeTab:CreateButton({
+    Name = "Dodge Stats",
     Callback = function()
-        local bosses = scanBosses()
-        if State.bossESP then buildESP(bosses) end
-        for i,b in ipairs(bosses) do
-            print(string.format("[Axiom] Boss[%d] %s | %.0fHP | %.1fst",
-                i, b.name, b.health, b.distance))
-        end
-        notify("Boss Scan", #bosses.." found", 3)
+        notify("Dodge Stats", "Total dodges: "..State.totalDodges, 3)
+        print("[Axiom] Total dodges:", State.totalDodges)
     end,
 })
 
-BossTab:CreateButton({
-    Name = "Clear ESP",
+-- ============================================================
+-- TAB 3 — SETTINGS
+-- ============================================================
+local SettingsTab = Window:CreateTab("Settings", 6031080504)
+
+SettingsTab:CreateButton({
+    Name = "Clear All ESP",
     Callback = function()
-        clearESP(); State.bossESP = false
+        clearESP()
+        State.espEnabled = false
         notify("ESP", "Cleared", 2)
     end,
 })
 
--- TAB 4 — TRAVEL
-local TravelTab = Window:CreateTab("Travel", 6031080504)
-
-local districtNames = {}
-for _, d in ipairs(Districts) do table.insert(districtNames, d.Name) end
-
-TravelTab:CreateDropdown({
-    Name = "Target District", Options = districtNames,
-    CurrentOption = "Starter District", Flag = "TargetDistrict",
-    Callback = function(val)
-        for _, d in ipairs(Districts) do
-            if d.Name == val then State.targetDistrict = d.Id break end
-        end
-    end,
-})
-
-TravelTab:CreateButton({
-    Name = "Travel Now",
-    Callback = function()
-        local ok = travelToDistrict(State.targetDistrict)
-        notify("Travel", ok and ("→ "..State.targetDistrict) or "Failed", 3)
-    end,
-})
-
-TravelTab:CreateToggle({
-    Name = "Auto Travel", CurrentValue = false, Flag = "AutoTravel",
-    Callback = function(val)
-        State.autoTravel = val
-        if val then task.spawn(autoTravelLoop) end
-        notify("Auto Travel", val and "Active" or "Stopped", 2)
-    end,
-})
-
--- TAB 5 — REWARDS
-local RewardsTab = Window:CreateTab("Rewards", 6031071057)
-
-RewardsTab:CreateToggle({
-    Name = "Auto Claim Rewards", CurrentValue = false, Flag = "AutoRewards",
-    Callback = function(val)
-        State.autoRewards = val
-        if val then task.spawn(autoRewardsLoop) end
-        notify("Auto Rewards", val and "Claiming" or "Stopped", 2)
-    end,
-})
-
-RewardsTab:CreateButton({
-    Name = "Claim All Now",
-    Callback = function()
-        local claimed = 0
-        for i = 1, 8 do
-            if claimReward(i) then claimed = claimed + 1 end
-            task.wait(0.3)
-        end
-        State.rewardsClaimed = State.rewardsClaimed + claimed
-        notify("Rewards", claimed.." claimed", 3)
-    end,
-})
-
--- TAB 6 — SETTINGS
-local SettingsTab = Window:CreateTab("Settings", 6031080504)
-
 SettingsTab:CreateButton({
     Name = "Session Report",
     Callback = function()
-        local tracked = 0
-        for _ in pairs(State.interceptedItems) do tracked = tracked + 1 end
         local msg = string.format(
-            "Collected:%d Tracked:%d\nPrestige:%d Rewards:%d\nFarm:%s Boss:%s",
-            State.totalCollected, tracked,
-            State.prestigeCount, State.rewardsClaimed,
-            State.autoCollect and "ON" or "OFF",
-            State.autoBoss    and "ON" or "OFF"
+            "ESP:%s Dodge:%s\nTotal Dodges:%d\nPlayers in server:%d",
+            State.espEnabled and "ON" or "OFF",
+            State.autoDodge  and "ON" or "OFF",
+            State.totalDodges,
+            #Players:GetPlayers() - 1
         )
+        notify("Session", msg, 5)
         print("[Axiom]\n"..msg)
-        notify("Session", msg, 6)
     end,
 })
 
-SettingsTab:CreateButton({
-    Name = "Cooldown Status",
-    Callback = function()
-        local rem = math.max(State.cooldownEndsAt - Workspace:GetServerTimeNow(), 0)
-        notify("Cooldown",
-            State.battleCooldown and string.format("%.1fs left", rem) or "Clear", 3)
-    end,
-})
-
+-- ============================================================
+-- RESPAWN
+-- ============================================================
 LocalPlayer.CharacterAdded:Connect(function()
-    State.autoCollect = false
-    State.autoBoss    = false
-    clearESP()
-    notify("Respawned", "Re-enable toggles", 3)
+    State.autoDodge   = false
+    State.dodgeCooldown = false
+    task.wait(1)
+    if State.espEnabled then refreshESP() end
+    notify("Respawned", "Dodge reset — re-enable", 3)
 end)
 
-print("[AxiomHub v2.3] Loaded — spawned + chunks handlers active")
+print("[AxiomHub] Silent Assassins loaded — ESP + Auto Dodge active")
