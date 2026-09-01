@@ -1,7 +1,7 @@
 -- ============================================================
---  MOG OR DIE — AXIOM HUB v2.2
---  FIX: Auto Collect now teleports CFrame directly to items
---  Server detects proximity on its own heartbeat — no remote needed
+--  MOG OR DIE — AXIOM HUB v2.3
+--  FIX: correct action names "spawned" + "chunks"
+--  FIX: spawned sends args differently — handled below
 -- ============================================================
 
 local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
@@ -13,9 +13,6 @@ local Workspace         = game:GetService("Workspace")
 
 local LocalPlayer = Players.LocalPlayer
 
--- ============================================================
--- REMOTES
--- ============================================================
 local MogOrDie            = ReplicatedStorage:WaitForChild("MogOrDie", 15)
 local Config              = require(MogOrDie:WaitForChild("Config"))
 local CollectibleStream   = MogOrDie:WaitForChild("CollectibleStream", 10)
@@ -34,9 +31,6 @@ for typeName in Config.Collectibles do
 end
 table.sort(SortedTypes)
 
--- ============================================================
--- DISTRICTS
--- ============================================================
 local Districts = {
     { Id = "StarterDistrict", Name = "Starter District" },
     { Id = "Downtown",        Name = "Downtown"         },
@@ -46,9 +40,6 @@ local Districts = {
     { Id = "Agartha",         Name = "Agartha"          },
 }
 
--- ============================================================
--- STATE
--- ============================================================
 local State = {
     autoCollect      = false,
     totalCollected   = 0,
@@ -70,23 +61,15 @@ local State = {
     cooldownEndsAt   = 0,
 }
 
--- ============================================================
--- NOTIFY
--- ============================================================
 local function notify(title, content, duration)
     pcall(function()
         Rayfield:Notify({
-            Title    = title,
-            Content  = content,
-            Duration = duration or 3,
-            Image    = 4483362458,
+            Title = title, Content = content,
+            Duration = duration or 3, Image = 4483362458,
         })
     end)
 end
 
--- ============================================================
--- UTILITY
--- ============================================================
 local function getRoot()
     local c = LocalPlayer.Character
     return c and c:FindFirstChild("HumanoidRootPart")
@@ -112,59 +95,74 @@ local function nameMatch(name, frags)
 end
 
 -- ============================================================
--- STREAM INTERCEPTOR
+-- REGISTER ITEM — shared between spawned + chunks handlers
+-- confirmed payload: [1]=id [2]=typeIdx [3]=X [4]=Y [5]=Z
+--                   [6]=golden [7]=diamond [8]=agartha
+-- ============================================================
+local function registerItem(p)
+    if type(p) ~= "table" then return end
+    local id = p[1]
+    if not id then return end
+    State.interceptedItems[id] = {
+        id       = id,
+        typeName = SortedTypes[p[2]],
+        position = Vector3.new(p[3] or 0, p[4] or 0, p[5] or 0),
+        golden   = p[6] == 1,
+        diamond  = p[7] == 1,
+        agartha  = p[8] == 1,
+        t        = os.clock(),
+    }
+end
+
+-- ============================================================
+-- STREAM INTERCEPTOR — corrected action names
 -- ============================================================
 local function installInterceptor()
     for _, conn in getconnections(CollectibleStream.OnClientEvent) do
         local old; old = hookfunction(conn.Function, function(...)
             local raw    = { ... }
             local action = raw[1]
-            if action == "add" or action == "collected" then
-                local p = raw[2]
+
+            if action == "spawned" then
+                -- spawned sends: "spawned", chunkKey, itemTable
+                -- raw[2] = chunkKey (string like "209:201")
+                -- raw[3] = item payload table
+                local p = raw[3]
                 if type(p) == "table" then
-                    State.interceptedItems[p[1]] = {
-                        id       = p[1],
-                        typeName = SortedTypes[p[2]],
-                        position = Vector3.new(p[3], p[4], p[5]),
-                        golden   = p[6] == 1,
-                        diamond  = p[7] == 1,
-                        t        = os.clock(),
-                    }
+                    registerItem(p)
+                else
+                    -- fallback: maybe raw[2] IS the item
+                    registerItem(raw[2])
                 end
-            elseif action == "remove" then
-                State.interceptedItems[raw[2]] = nil
-            elseif action == "batch" then
+
+            elseif action == "chunks" then
+                -- chunks sends: "chunks", { [chunkKey] = { item, item, ... } }
                 local batch = raw[2]
                 if type(batch) == "table" then
                     for _, items in pairs(batch) do
                         if type(items) == "table" then
                             for _, p in ipairs(items) do
-                                if type(p) == "table" then
-                                    State.interceptedItems[p[1]] = {
-                                        id       = p[1],
-                                        typeName = SortedTypes[p[2]],
-                                        position = Vector3.new(p[3] or 0, p[4] or 0, p[5] or 0),
-                                        golden   = p[6] == 1,
-                                        diamond  = p[7] == 1,
-                                        t        = os.clock(),
-                                    }
-                                end
+                                registerItem(p)
                             end
                         end
                     end
                 end
+
+            elseif action == "collected" or action == "remove" then
+                -- item was collected — remove from registry
+                local id = raw[2]
+                if id then State.interceptedItems[id] = nil end
             end
+
             return old(...)
         end)
     end
-    print("[Axiom] Stream interceptor installed")
+    print("[Axiom] Interceptor v2.3 installed — watching spawned + chunks")
 end
 installInterceptor()
 
 -- ============================================================
--- AUTO COLLECT — CFrame teleport method
--- source confirmed: server checks character proximity on heartbeat
--- no remote needed — just get within CollectRadius studs
+-- AUTO COLLECT — CFrame teleport
 -- ============================================================
 local function prioritySort(a, b)
     if State.priorityDiamond then
@@ -179,7 +177,6 @@ local function autoCollectLoop()
         if isAlive() then
             local root = getRoot()
             if root then
-                -- build sorted list
                 local list = {}
                 for _, item in pairs(State.interceptedItems) do
                     table.insert(list, item)
@@ -189,18 +186,14 @@ local function autoCollectLoop()
                 for _, item in ipairs(list) do
                     if not State.autoCollect then break end
                     if not isAlive() then break end
-
                     root = getRoot()
                     if not root then break end
 
                     -- teleport directly onto item
-                    -- server heartbeat detects we're within CollectRadius
                     root.CFrame = CFrame.new(item.position)
-
-                    -- wait 2 server ticks for collection to register
                     task.wait(0.1)
 
-                    -- also fire any touch triggers on nearby ClientCollectibles parts
+                    -- fire touch triggers on nearby parts
                     local cc = Workspace:FindFirstChild("ClientCollectibles")
                     if cc then
                         for _, child in ipairs(cc:GetChildren()) do
@@ -453,7 +446,7 @@ end
 local Window = Rayfield:CreateWindow({
     Name                   = "Axiom Hub  |  Mog or Die",
     LoadingTitle           = "Axiom Hub",
-    LoadingSubtitle        = "v2.2 — Collect Fixed",
+    LoadingSubtitle        = "v2.3 — Stream Fixed",
     Theme                  = "Default",
     DisableRayfieldPrompts = false,
     ConfigurationSaving    = { Enabled = false },
@@ -490,17 +483,17 @@ CollectTab:CreateButton({
         local count = 0
         for _, item in pairs(State.interceptedItems) do
             count = count + 1
-            print(string.format("[Axiom] %s | %s | gold=%s dia=%s | pos=(%.1f,%.1f,%.1f)",
+            print(string.format("[Axiom] %s | %s | gold=%s dia=%s | (%.1f,%.1f,%.1f)",
                 tostring(item.id), tostring(item.typeName),
                 tostring(item.golden), tostring(item.diamond),
                 item.position.X, item.position.Y, item.position.Z))
         end
-        notify("Item Dump", count.." items logged", 3)
+        notify("Item Dump", count.." items tracked", 3)
     end,
 })
 
 CollectTab:CreateButton({
-    Name = "Reinstall Stream Hook",
+    Name = "Reinstall Hook",
     Callback = function()
         installInterceptor()
         notify("Hook", "Reinstalled", 2)
@@ -677,14 +670,10 @@ SettingsTab:CreateButton({
     Callback = function()
         local rem = math.max(State.cooldownEndsAt - Workspace:GetServerTimeNow(), 0)
         notify("Cooldown",
-            State.battleCooldown and string.format("%.1fs left", rem) or "Clear",
-            3)
+            State.battleCooldown and string.format("%.1fs left", rem) or "Clear", 3)
     end,
 })
 
--- ============================================================
--- RESPAWN
--- ============================================================
 LocalPlayer.CharacterAdded:Connect(function()
     State.autoCollect = false
     State.autoBoss    = false
@@ -692,4 +681,4 @@ LocalPlayer.CharacterAdded:Connect(function()
     notify("Respawned", "Re-enable toggles", 3)
 end)
 
-print("[AxiomHub v2.2] Loaded — CFrame collect active")
+print("[AxiomHub v2.3] Loaded — spawned + chunks handlers active")
